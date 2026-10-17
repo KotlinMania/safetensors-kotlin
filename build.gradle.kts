@@ -335,7 +335,7 @@ fun requestedTaskWantsAndroid(rawTaskName: String): Boolean {
     val taskName = rawTaskName.substringAfterLast(':')
     if (taskName.contains("AndroidNative")) return false // Kotlin/Native, no SDK
     if (taskName.contains("Android")) return true // direct AGP tasks
-    return taskName in setOf("build", "assemble", "check") // aggregates pull android
+    return taskName in setOf("build", "assemble", "check", "test", "hostTests") // aggregates pull android
 }
 
 if (gradle.startParameter.taskNames.any(::requestedTaskWantsAndroid)) {
