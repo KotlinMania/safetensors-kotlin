@@ -1,11 +1,26 @@
 // port-lint: source tensor.rs
 package io.github.kotlinmania.safetensors
 
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
+import io.github.kotlinmania.serde.SerdeError
+import io.github.kotlinmania.serde.SerdeException
+import io.github.kotlinmania.serde.SerdeResult
+import io.github.kotlinmania.serde.serdeCatching
+import io.github.kotlinmania.serdecore.de.Deserialize
+import io.github.kotlinmania.serdecore.de.DeserializeSeed
+import io.github.kotlinmania.serdecore.de.Deserializer
+import io.github.kotlinmania.serdecore.de.EnumAccess
+import io.github.kotlinmania.serdecore.de.MapAccess
+import io.github.kotlinmania.serdecore.de.StringDeserialize
+import io.github.kotlinmania.serdecore.de.U64Deserialize
+import io.github.kotlinmania.serdecore.de.Visitor
+import io.github.kotlinmania.serdecore.de.mutableListDeserialize
+import io.github.kotlinmania.serdecore.de.pairDeserialize
+import io.github.kotlinmania.serdecore.ser.Serialize
+import io.github.kotlinmania.serdecore.ser.Serializer
+import io.github.kotlinmania.serdecore.ser.serialize
+import io.github.kotlinmania.serdejson.Value
+import io.github.kotlinmania.serdejson.fromStr
+import io.github.kotlinmania.serdejson.toVec
 
 internal const val MAX_HEADER_SIZE: Int = 100_000_000
 internal const val N_LEN: Int = 8
@@ -179,66 +194,10 @@ public data class ReadMetadataOutput(
     public val metadata: Metadata,
 )
 
-private fun escapeJsonString(value: String): String {
-    val sb = StringBuilder(value.length + 2)
-    sb.append('"')
-    for (ch in value) {
-        when (ch) {
-            '"' -> sb.append("\\\"")
-            '\\' -> sb.append("\\\\")
-            '\b' -> sb.append("\\b")
-            '\u000C' -> sb.append("\\f")
-            '\n' -> sb.append("\\n")
-            '\r' -> sb.append("\\r")
-            '\t' -> sb.append("\\t")
-            else -> if (ch.code < 0x20) sb.append("\\u").append(ch.code.toString(16).padStart(4, '0')) else sb.append(ch)
-        }
+private fun serializeMetadataToJsonBytes(metadata: Metadata): ByteArray =
+    toVec(metadata).getOrElse { e ->
+        throw SafeTensorError.JsonError(e.message)
     }
-    sb.append('"')
-    return sb.toString()
-}
-
-private fun serializeMetadataToJsonBytes(metadata: Metadata): ByteArray {
-    val sb = StringBuilder()
-    sb.append('{')
-    var firstEntry = true
-    val metaMap = metadata.metadata()
-    if (metaMap != null) {
-        sb.append("\"__metadata__\":{")
-        var firstMeta = true
-        for ((k, v) in metaMap) {
-            if (!firstMeta) sb.append(',')
-            firstMeta = false
-            sb.append(escapeJsonString(k)).append(':').append(escapeJsonString(v))
-        }
-        sb.append('}')
-        firstEntry = false
-    }
-
-    val names = Array(metadata.indexMap.size) { "" }
-    for ((name, index) in metadata.indexMap) {
-        names[index] = name
-    }
-
-    for (i in names.indices) {
-        if (!firstEntry) sb.append(',')
-        firstEntry = false
-        val name = names[i]
-        val info = metadata.tensorsList[i]
-        sb.append(escapeJsonString(name)).append(":{")
-        sb.append("\"dtype\":").append(escapeJsonString(info.dtype.toString())).append(',')
-        sb.append("\"shape\":[")
-        for (j in info.shape.indices) {
-            if (j > 0) sb.append(',')
-            sb.append(info.shape[j])
-        }
-        sb.append("],\"data_offsets\":[")
-        sb.append(info.dataOffsets.start).append(',').append(info.dataOffsets.stop)
-        sb.append("]}")
-    }
-    sb.append('}')
-    return sb.toString().encodeToByteArray()
-}
 
 private fun nextMultipleOf(value: Int, multiple: Int): Int {
     val rem = value % multiple
@@ -492,94 +451,100 @@ public class SafeTensors internal constructor(
     public fun isEmpty(): Boolean = metadata.tensorsList.isEmpty()
 }
 
+private class SeedOf<T>(
+    private val deserialize: Deserialize<T>,
+) : DeserializeSeed<T> {
+    override fun <D> deserialize(deserializer: D): SerdeResult<T>
+        where D : Deserializer = deserialize.deserialize(deserializer)
+}
+
+private class StringSerialize(
+    private val value: String,
+) : Serialize {
+    override fun <Ok> serialize(serializer: Serializer<Ok>): SerdeResult<Ok> = value.serialize(serializer)
+}
+
+private class StringMapSerialize(
+    private val value: Map<String, String>,
+) : Serialize {
+    override fun <Ok> serialize(serializer: Serializer<Ok>): SerdeResult<Ok> = value.serialize(serializer)
+}
+
+private class IntListSerialize(
+    private val value: List<Int>,
+) : Serialize {
+    override fun <Ok> serialize(serializer: Serializer<Ok>): SerdeResult<Ok> = value.serialize(serializer)
+}
+
+private class OffsetsPairSerialize(
+    private val start: Int,
+    private val stop: Int,
+) : Serialize {
+    override fun <Ok> serialize(serializer: Serializer<Ok>): SerdeResult<Ok> = Pair(start, stop).serialize(serializer)
+}
+
 private fun parseHashMetadata(jsonString: String): Metadata {
     val trimmed = jsonString.trim { it == ' ' || it == '\t' || it == '\n' || it == '\r' }
     if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
         throw SafeTensorError.InvalidHeaderDeserialization("expected JSON object")
     }
-    val element: JsonElement =
-        try {
-            Json.parseToJsonElement(trimmed)
-        } catch (e: Exception) {
-            throw SafeTensorError.InvalidHeaderDeserialization(e.message ?: "invalid JSON")
+    val element: Value =
+        fromStr(trimmed).getOrElse { e ->
+            throw SafeTensorError.InvalidHeaderDeserialization(e.message)
         }
     val rootObj =
-        element as? JsonObject
+        element.asObject()
             ?: throw SafeTensorError.InvalidHeaderDeserialization("header root must be a JSON object")
 
     var metadataMap: Map<String, String>? = null
     val rawTensors = ArrayList<NamedTensorInfo>()
 
-    for ((key, value) in rootObj.entries) {
+    for ((key, value) in rootObj) {
         if (key == "__metadata__") {
-            if (value is JsonPrimitive && value.isString) {
-                throw SafeTensorError.InvalidHeaderDeserialization("__metadata__ must be an object")
-            }
             val metaObj =
-                value as? JsonObject
+                value.asObject()
                     ?: throw SafeTensorError.InvalidHeaderDeserialization("__metadata__ must be an object")
-            val map = LinkedHashMap<String, String>(metaObj.size)
-            for ((mk, mv) in metaObj.entries) {
-                val prim =
-                    mv as? JsonPrimitive
+            val map = LinkedHashMap<String, String>(metaObj.len())
+            for ((mk, mv) in metaObj) {
+                val strVal =
+                    mv.asStr()
                         ?: throw SafeTensorError.InvalidHeaderDeserialization("metadata value must be a string")
-                if (!prim.isString) {
-                    throw SafeTensorError.InvalidHeaderDeserialization("metadata value must be a string")
-                }
-                map[mk] = prim.content
+                map[mk] = strVal
             }
             metadataMap = map
         } else {
             val tensorObj =
-                value as? JsonObject
+                value.asObject()
                     ?: throw SafeTensorError.InvalidHeaderDeserialization("tensor entry '$key' must be an object")
-            val dtypeElem =
-                tensorObj["dtype"] as? JsonPrimitive
+            val dtypeStr =
+                tensorObj["dtype"]?.asStr()
                     ?: throw SafeTensorError.InvalidHeaderDeserialization("missing dtype for '$key'")
-            if (!dtypeElem.isString) {
-                throw SafeTensorError.InvalidHeaderDeserialization("dtype must be a string")
-            }
             val dtype =
-                Dtype.fromWireName(dtypeElem.content)
-                    ?: throw SafeTensorError.InvalidHeaderDeserialization("unknown dtype '${dtypeElem.content}'")
+                Dtype.fromWireName(dtypeStr)
+                    ?: throw SafeTensorError.InvalidHeaderDeserialization("unknown dtype '$dtypeStr'")
 
             val shapeArr =
-                tensorObj["shape"] as? JsonArray
+                tensorObj["shape"]?.asArray()
                     ?: throw SafeTensorError.InvalidHeaderDeserialization("missing shape for '$key'")
             val shapeULongs = ArrayList<ULong>(shapeArr.size)
             for (dimElem in shapeArr) {
-                val prim =
-                    dimElem as? JsonPrimitive
-                        ?: throw SafeTensorError.InvalidHeaderDeserialization("shape element must be integer")
-                if (prim.isString) {
-                    throw SafeTensorError.InvalidHeaderDeserialization("shape element must be integer")
-                }
                 val dimULong =
-                    prim.content.toULongOrNull()
-                        ?: throw SafeTensorError.InvalidHeaderDeserialization("invalid shape dimension '${prim.content}'")
+                    dimElem.asU64()
+                        ?: throw SafeTensorError.InvalidHeaderDeserialization("shape element must be integer")
                 shapeULongs.add(dimULong)
             }
 
             val offsetsArr =
-                tensorObj["data_offsets"] as? JsonArray
+                tensorObj["data_offsets"]?.asArray()
                     ?: throw SafeTensorError.InvalidHeaderDeserialization("missing data_offsets for '$key'")
             if (offsetsArr.size != 2) {
                 throw SafeTensorError.InvalidHeaderDeserialization("data_offsets must have 2 elements")
             }
-            val startPrim =
-                offsetsArr[0] as? JsonPrimitive
-                    ?: throw SafeTensorError.InvalidHeaderDeserialization("data_offsets[0] must be integer")
-            val stopPrim =
-                offsetsArr[1] as? JsonPrimitive
-                    ?: throw SafeTensorError.InvalidHeaderDeserialization("data_offsets[1] must be integer")
-            if (startPrim.isString || stopPrim.isString) {
-                throw SafeTensorError.InvalidHeaderDeserialization("data_offsets must be integers")
-            }
             val startULong =
-                startPrim.content.toULongOrNull()
+                offsetsArr[0].asU64()
                     ?: throw SafeTensorError.InvalidHeaderDeserialization("invalid start offset")
             val stopULong =
-                stopPrim.content.toULongOrNull()
+                offsetsArr[1].asU64()
                     ?: throw SafeTensorError.InvalidHeaderDeserialization("invalid stop offset")
 
             val shapeInts = ArrayList<Int>(shapeULongs.size)
@@ -623,8 +588,8 @@ public class Metadata internal constructor(
     private val metadataMap: Map<String, String>?,
     internal val tensorsList: List<TensorInfo>,
     internal val indexMap: Map<String, Int>,
-) {
-    public companion object {
+) : Serialize {
+    public companion object : Deserialize<Metadata> {
         /**
          * Creates a new [Metadata] structure.
          * May fail if there is incorrect data in the [TensorInfo].
@@ -644,7 +609,64 @@ public class Metadata internal constructor(
             result.validate()
             return result
         }
+
+        override fun <D> deserialize(deserializer: D): SerdeResult<Metadata>
+            where D : Deserializer =
+            deserializer.deserializeMap(
+                object : Visitor<Metadata> {
+                    override fun expecting(): String = "struct Metadata"
+
+                    override fun <A> visitMap(access: A): SerdeResult<Metadata>
+                        where A : MapAccess =
+                        serdeCatching {
+                            var meta: Map<String, String>? = null
+                            val rawTensors = ArrayList<NamedTensorInfo>()
+                            val metaDeserialize =
+                                io.github.kotlinmania.serdecore.de.mapDeserialize(
+                                    StringDeserialize,
+                                    StringDeserialize,
+                                )
+                            while (true) {
+                                val key = access.nextKeySeed(SeedOf(StringDeserialize)).getOrThrow() ?: break
+                                if (key == "__metadata__") {
+                                    meta = access.nextValueSeed(SeedOf(metaDeserialize)).getOrThrow()
+                                } else {
+                                    val info = access.nextValueSeed(SeedOf(TensorInfo.Companion)).getOrThrow()
+                                    rawTensors.add(NamedTensorInfo(key, info))
+                                }
+                            }
+                            rawTensors.sortWith { a, b ->
+                                val aOffsets = a.info.dataOffsets
+                                val bOffsets = b.info.dataOffsets
+                                val startCmp = aOffsets.start.compareTo(bOffsets.start)
+                                if (startCmp != 0) startCmp else aOffsets.stop.compareTo(bOffsets.stop)
+                            }
+                            try {
+                                new(meta, rawTensors)
+                            } catch (e: SafeTensorError) {
+                                throw SerdeException(SerdeError.custom(e.message ?: "invalid metadata"))
+                            }
+                        }
+                },
+            )
     }
+
+    override fun <Ok> serialize(serializer: Serializer<Ok>): SerdeResult<Ok> =
+        serdeCatching {
+            val names = Array(indexMap.size) { "" }
+            for ((name, index) in indexMap) {
+                names[index] = name
+            }
+            val length = if (metadataMap != null) 1 else 0
+            val map = serializer.serializeMap(tensorsList.size + length).getOrThrow()
+            if (metadataMap != null) {
+                map.serializeEntry(StringSerialize("__metadata__"), StringMapSerialize(metadataMap)).getOrThrow()
+            }
+            for (i in names.indices) {
+                map.serializeEntry(StringSerialize(names[i]), tensorsList[i]).getOrThrow()
+            }
+            map.end().getOrThrow()
+        }
 
     internal fun validate(): Int {
         var start = 0
@@ -829,12 +851,80 @@ public class TensorInfo internal constructor(
     /** The offsets to find the data within the byte-buffer array. */
     public val dataOffsets: ByteSpan,
     internal val rawShapeULongs: List<ULong>? = null,
-) {
+) : Serialize {
     public constructor(
         dtype: Dtype,
         shape: List<Int>,
         dataOffsets: ByteSpan,
     ) : this(dtype, shape, dataOffsets, null)
+
+    public companion object : Deserialize<TensorInfo> {
+        private val FIELDS: List<String> = listOf("dtype", "shape", "data_offsets")
+
+        override fun <D> deserialize(deserializer: D): SerdeResult<TensorInfo>
+            where D : Deserializer =
+            deserializer.deserializeStruct(
+                "TensorInfo",
+                FIELDS,
+                object : Visitor<TensorInfo> {
+                    override fun expecting(): String = "struct TensorInfo"
+
+                    override fun <A> visitMap(access: A): SerdeResult<TensorInfo>
+                        where A : MapAccess =
+                        serdeCatching {
+                            var dtypeVal: Dtype? = null
+                            var shapeULongs: List<ULong>? = null
+                            var offsetsPair: Pair<ULong, ULong>? = null
+                            val shapeDe = mutableListDeserialize(U64Deserialize)
+                            val offsetsDe = pairDeserialize(U64Deserialize, U64Deserialize)
+                            while (true) {
+                                val key = access.nextKeySeed(SeedOf(StringDeserialize)).getOrThrow() ?: break
+                                when (key) {
+                                    "dtype" -> {
+                                        if (dtypeVal != null) throw SerdeException(SerdeError.duplicateField("dtype"))
+                                        dtypeVal = access.nextValueSeed(SeedOf(Dtype.Companion)).getOrThrow()
+                                    }
+
+                                    "shape" -> {
+                                        if (shapeULongs != null) throw SerdeException(SerdeError.duplicateField("shape"))
+                                        shapeULongs = access.nextValueSeed(SeedOf(shapeDe)).getOrThrow()
+                                    }
+
+                                    "data_offsets" -> {
+                                        if (offsetsPair != null) throw SerdeException(SerdeError.duplicateField("data_offsets"))
+                                        offsetsPair = access.nextValueSeed(SeedOf(offsetsDe)).getOrThrow()
+                                    }
+
+                                    else -> {
+                                        throw SerdeException(SerdeError.unknownField(key, FIELDS))
+                                    }
+                                }
+                            }
+                            val dt = dtypeVal ?: throw SerdeException(SerdeError.missingField("dtype"))
+                            val shULongs = shapeULongs ?: throw SerdeException(SerdeError.missingField("shape"))
+                            val off = offsetsPair ?: throw SerdeException(SerdeError.missingField("data_offsets"))
+                            val shapeInts = shULongs.map { d -> if (d > Int.MAX_VALUE.toULong()) Int.MAX_VALUE else d.toInt() }
+                            val startInt = if (off.first > Int.MAX_VALUE.toULong()) Int.MAX_VALUE else off.first.toInt()
+                            val stopInt = if (off.second > Int.MAX_VALUE.toULong()) Int.MAX_VALUE else off.second.toInt()
+                            TensorInfo(
+                                dtype = dt,
+                                shape = shapeInts,
+                                dataOffsets = ByteSpan(startInt, stopInt),
+                                rawShapeULongs = shULongs,
+                            )
+                        }
+                },
+            )
+    }
+
+    override fun <Ok> serialize(serializer: Serializer<Ok>): SerdeResult<Ok> =
+        serdeCatching {
+            val state = serializer.serializeStruct("TensorInfo", 3).getOrThrow()
+            state.serializeField("dtype", dtype).getOrThrow()
+            state.serializeField("shape", IntListSerialize(shape)).getOrThrow()
+            state.serializeField("data_offsets", OffsetsPairSerialize(dataOffsets.start, dataOffsets.stop)).getOrThrow()
+            state.end().getOrThrow()
+        }
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -858,7 +948,7 @@ public class TensorInfo internal constructor(
  */
 public enum class Dtype(
     internal val wireName: String,
-) {
+) : Serialize {
     /** Boolean type. */
     BOOL("BOOL"),
 
@@ -926,6 +1016,9 @@ public enum class Dtype(
     U64("U64"),
     ;
 
+    override fun <Ok> serialize(serializer: Serializer<Ok>): SerdeResult<Ok> =
+        serializer.serializeUnitVariant("Dtype", ordinal.toUInt(), wireName)
+
     /** Gives out the size (in bits) of 1 element of this dtype. */
     public fun bitsize(): Int =
         when (this) {
@@ -958,7 +1051,34 @@ public enum class Dtype(
 
     override fun toString(): String = wireName
 
-    public companion object {
+    public companion object : Deserialize<Dtype> {
+        private val VARIANTS: List<String> = entries.map { it.wireName }
+
         public fun fromWireName(name: String): Dtype? = entries.firstOrNull { it.wireName == name }
+
+        override fun <D> deserialize(deserializer: D): SerdeResult<Dtype>
+            where D : Deserializer =
+            deserializer.deserializeEnum(
+                "Dtype",
+                VARIANTS,
+                object : Visitor<Dtype> {
+                    override fun expecting(): String = "enum Dtype"
+
+                    override fun visitStr(v: String): SerdeResult<Dtype> =
+                        fromWireName(v)?.let { SerdeResult.success(it) }
+                            ?: SerdeResult.failure(SerdeError.unknownVariant(v, VARIANTS))
+
+                    override fun visitString(v: String): SerdeResult<Dtype> = visitStr(v)
+
+                    override fun <A> visitEnum(access: A): SerdeResult<Dtype>
+                        where A : EnumAccess =
+                        serdeCatching {
+                            val (variantName, variant) = access.variantSeed(SeedOf(StringDeserialize)).getOrThrow()
+                            variant.unitVariant().getOrThrow()
+                            fromWireName(variantName)
+                                ?: throw SerdeException(SerdeError.unknownVariant(variantName, VARIANTS))
+                        }
+                },
+            )
     }
 }
