@@ -8,9 +8,9 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-private const val MAX_DIMENSION: Int = 5
-private const val MAX_SIZE: Int = 5
-private const val MAX_TENSORS: Int = 5
+private const val MAX_DIMENSION: Int = 8
+private const val MAX_SIZE: Int = 8
+private const val MAX_TENSORS: Int = 8
 
 private fun floatToLe(value: Float): ByteArray {
     val bits = value.toRawBits()
@@ -34,17 +34,18 @@ private fun floatsToLe(vararg values: Float): ByteArray {
 private fun bytesFromCsv(csv: String): ByteArray =
     csv.split(',').map { it.trim().toInt().toByte() }.toByteArray()
 
-private fun arbitraryDtype(rng: Random): Dtype {
+internal fun arbitraryDtype(rng: Random = Random): Dtype {
     val choices =
-        arrayOf(
+        listOf(
             Dtype.BOOL,
             Dtype.F4,
             Dtype.F6_E3M2,
             Dtype.F6_E2M3,
+            Dtype.F8_E8M0,
             Dtype.F8_E5M2,
             Dtype.F8_E4M3,
-            Dtype.U8,
             Dtype.I8,
+            Dtype.U8,
             Dtype.I16,
             Dtype.U16,
             Dtype.I32,
@@ -60,12 +61,12 @@ private fun arbitraryDtype(rng: Random): Dtype {
     return choices[rng.nextInt(choices.size)]
 }
 
-private fun arbitraryShape(rng: Random): List<Int> {
+internal fun arbitraryShape(rng: Random = Random): List<Int> {
     val length = rng.nextInt(1, MAX_DIMENSION)
     return List(length) { rng.nextInt(1, MAX_SIZE) }
 }
 
-private fun arbitraryMetadata(rng: Random): Metadata {
+internal fun arbitraryMetadata(rng: Random = Random): Metadata {
     while (true) {
         val size = rng.nextInt(1, MAX_TENSORS)
         val dtypes = List(size) { arbitraryDtype(rng) }
@@ -98,9 +99,9 @@ private fun arbitraryMetadata(rng: Random): Metadata {
     }
 }
 
-private fun dataSize(metadata: Metadata): Int = metadata.dataLen()
+internal fun dataSize(metadata: Metadata): Int = metadata.dataLen()
 
-private fun asciiWithEscapes(
+internal fun asciiWithEscapes(
     prefix: ByteArray,
     json: String,
     suffix: ByteArray,
@@ -111,6 +112,68 @@ private fun asciiWithEscapes(
     jsonBytes.copyInto(out, prefix.size)
     suffix.copyInto(out, prefix.size + jsonBytes.size)
     return out
+}
+
+internal fun gpt2Like(
+    nHeads: Int,
+    modelId: String,
+) {
+    val tensorsDesc = ArrayList<Pair<String, List<Int>>>()
+    tensorsDesc.add("wte" to listOf(50, 76))
+    tensorsDesc.add("wpe" to listOf(10, 76))
+    for (i in 0 until nHeads) {
+        tensorsDesc.add("h.$i.ln_1.weight" to listOf(76))
+        tensorsDesc.add("h.$i.ln_1.bias" to listOf(76))
+        tensorsDesc.add("h.$i.attn.bias" to listOf(1, 1, 10, 10))
+        tensorsDesc.add("h.$i.attn.c_attn.weight" to listOf(76, 230))
+        tensorsDesc.add("h.$i.attn.c_attn.bias" to listOf(230))
+        tensorsDesc.add("h.$i.attn.c_proj.weight" to listOf(76, 76))
+        tensorsDesc.add("h.$i.attn.c_proj.bias" to listOf(76))
+        tensorsDesc.add("h.$i.ln_2.weight" to listOf(76))
+        tensorsDesc.add("h.$i.ln_2.bias" to listOf(76))
+        tensorsDesc.add("h.$i.mlp.c_fc.weight" to listOf(76, 307))
+        tensorsDesc.add("h.$i.mlp.c_fc.bias" to listOf(307))
+        tensorsDesc.add("h.$i.mlp.c_proj.weight" to listOf(307, 76))
+        tensorsDesc.add("h.$i.mlp.c_proj.bias" to listOf(76))
+    }
+    tensorsDesc.add("ln_f.weight" to listOf(76))
+    tensorsDesc.add("ln_f.bias" to listOf(76))
+
+    val dtype = Dtype.F32
+    var totalElements = 0
+    for ((_, shape) in tensorsDesc) {
+        var prod = 1
+        for (d in shape) prod *= d
+        totalElements += prod
+    }
+    val nbits = totalElements * dtype.bitsize()
+    if (nbits % 8 != 0) {
+        error("Misaligned slice")
+    }
+    val n = nbits / 8
+    val allData = ByteArray(n)
+    val metadata = LinkedHashMap<String, TensorView>(tensorsDesc.size)
+    var offset = 0
+    for ((name, shape) in tensorsDesc) {
+        var prod = 1
+        for (d in shape) prod *= d
+        val byteLen = (prod * dtype.bitsize()) / 8
+        val buffer = allData.copyOfRange(offset, offset + byteLen)
+        val tensor = TensorView.new(dtype, shape, buffer)
+        metadata[name] = tensor
+        offset += prod
+    }
+
+    val filename = "./out_$modelId.safetensors"
+    val out = serialize(metadata, null)
+    val deserialized1 = SafeTensors.deserialize(out)
+    assertEquals(tensorsDesc.size, deserialized1.len())
+
+    serializeToFile(metadata, null, filename)
+    val raw = readSerializedFile(filename)
+    val deserialized2 = SafeTensors.deserialize(raw)
+    assertEquals(tensorsDesc.size, deserialized2.len())
+    removeSerializedFile(filename)
 }
 
 class TensorTest {
@@ -311,68 +374,6 @@ class TensorTest {
     @Test
     fun testGpt2Tiny() {
         gpt2Like(6, "gpt2_tiny")
-    }
-
-    private fun gpt2Like(
-        nHeads: Int,
-        modelId: String,
-    ) {
-        val tensorsDesc = ArrayList<Pair<String, List<Int>>>()
-        tensorsDesc.add("wte" to listOf(50, 76))
-        tensorsDesc.add("wpe" to listOf(10, 76))
-        for (i in 0 until nHeads) {
-            tensorsDesc.add("h.$i.ln_1.weight" to listOf(76))
-            tensorsDesc.add("h.$i.ln_1.bias" to listOf(76))
-            tensorsDesc.add("h.$i.attn.bias" to listOf(1, 1, 10, 10))
-            tensorsDesc.add("h.$i.attn.c_attn.weight" to listOf(76, 230))
-            tensorsDesc.add("h.$i.attn.c_attn.bias" to listOf(230))
-            tensorsDesc.add("h.$i.attn.c_proj.weight" to listOf(76, 76))
-            tensorsDesc.add("h.$i.attn.c_proj.bias" to listOf(76))
-            tensorsDesc.add("h.$i.ln_2.weight" to listOf(76))
-            tensorsDesc.add("h.$i.ln_2.bias" to listOf(76))
-            tensorsDesc.add("h.$i.mlp.c_fc.weight" to listOf(76, 307))
-            tensorsDesc.add("h.$i.mlp.c_fc.bias" to listOf(307))
-            tensorsDesc.add("h.$i.mlp.c_proj.weight" to listOf(307, 76))
-            tensorsDesc.add("h.$i.mlp.c_proj.bias" to listOf(76))
-        }
-        tensorsDesc.add("ln_f.weight" to listOf(76))
-        tensorsDesc.add("ln_f.bias" to listOf(76))
-
-        val dtype = Dtype.F32
-        var totalElements = 0
-        for ((_, shape) in tensorsDesc) {
-            var prod = 1
-            for (d in shape) prod *= d
-            totalElements += prod
-        }
-        val nbits = totalElements * dtype.bitsize()
-        if (nbits % 8 != 0) {
-            error("Misaligned slice")
-        }
-        val n = nbits / 8
-        val allData = ByteArray(n)
-        val metadata = LinkedHashMap<String, TensorView>(tensorsDesc.size)
-        var offset = 0
-        for ((name, shape) in tensorsDesc) {
-            var prod = 1
-            for (d in shape) prod *= d
-            val byteLen = (prod * dtype.bitsize()) / 8
-            val buffer = allData.copyOfRange(offset, offset + byteLen)
-            val tensor = TensorView.new(dtype, shape, buffer)
-            metadata[name] = tensor
-            offset += prod
-        }
-
-        val filename = "./out_$modelId.safetensors"
-        val out = serialize(metadata, null)
-        val deserialized1 = SafeTensors.deserialize(out)
-        assertEquals(tensorsDesc.size, deserialized1.len())
-
-        serializeToFile(metadata, null, filename)
-        val raw = readSerializedFile(filename)
-        val deserialized2 = SafeTensors.deserialize(raw)
-        assertEquals(tensorsDesc.size, deserialized2.len())
-        removeSerializedFile(filename)
     }
 
     @Test

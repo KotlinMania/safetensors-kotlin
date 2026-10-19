@@ -24,6 +24,9 @@ import io.github.kotlinmania.serdejson.toVec
 
 internal const val MAX_HEADER_SIZE: Int = 100_000_000
 internal const val N_LEN: Int = 8
+internal const val MAX_DIMENSION: Int = 8
+internal const val MAX_SIZE: Int = 8
+internal const val MAX_TENSORS: Int = 8
 
 /**
  * Possible errors that could occur while reading or writing a Safetensor file.
@@ -140,8 +143,28 @@ public sealed class SafeTensorError(
         override fun hashCode(): Int = 7
     }
 
+    /**
+     * The lower-level source of this error, if any.
+     */
+    public fun source(): Throwable? = cause
+
+    public companion object {
+        public fun from(error: String): SafeTensorError = IoError(error)
+
+        public fun from(cause: Throwable): SafeTensorError =
+            when (cause) {
+                is SafeTensorError -> cause
+                else -> IoError(cause.message ?: "unknown I/O error")
+            }
+    }
+
     override fun toString(): String = message.orEmpty()
 }
+
+/**
+ * Type alias matching upstream `SafeTensorError` error type.
+ */
+public typealias Error = SafeTensorError
 
 private class PreparedData(
     val n: ULong,
@@ -204,7 +227,7 @@ private fun nextMultipleOf(value: Int, multiple: Int): Int {
     return if (rem == 0) value else value + (multiple - rem)
 }
 
-private fun prepareEntries(
+private fun prepare(
     entries: List<Pair<String, View>>,
     dataInfo: Map<String, String>?,
 ): Pair<PreparedData, List<View>> {
@@ -278,7 +301,7 @@ internal fun serializeEntries(
             throw SafeTensorError.HeaderTooLarge()
         }
     }
-    val (prepared, tensors) = prepareEntries(entries, dataInfo)
+    val (prepared, tensors) = prepare(entries, dataInfo)
     if (prepared.n > MAX_HEADER_SIZE.toULong()) {
         throw SafeTensorError.HeaderTooLarge()
     }
@@ -301,6 +324,27 @@ internal fun serializeEntries(
 
 private val virtualFileStore: MutableMap<String, ByteArray> = mutableMapOf()
 
+private fun bufferedWriteToFile(
+    filename: String,
+    n: ULong,
+    headerBytes: ByteArray,
+    tensors: List<View>,
+    totalSize: Int,
+) {
+    val buffer = ByteArray(totalSize)
+    for (i in 0 until N_LEN) {
+        buffer[i] = ((n shr (i * 8)) and 0xFFuL).toByte()
+    }
+    headerBytes.copyInto(buffer, destinationOffset = N_LEN)
+    var writePos = N_LEN + headerBytes.size
+    for (tensor in tensors) {
+        val bytes = tensor.data()
+        bytes.copyInto(buffer, destinationOffset = writePos)
+        writePos += bytes.size
+    }
+    virtualFileStore[filename] = buffer
+}
+
 /**
  * Serialize a map of tensors to a file at [filename].
  */
@@ -309,8 +353,13 @@ public fun serializeToFile(
     dataInfo: Map<String, String>?,
     filename: String,
 ) {
-    val bytes = serialize(data, dataInfo)
-    virtualFileStore[filename] = bytes
+    val entries = data.entries.map { it.key to it.value }
+    val (prepared, tensors) = prepare(entries, dataInfo)
+    if (prepared.n > MAX_HEADER_SIZE.toULong()) {
+        throw SafeTensorError.HeaderTooLarge()
+    }
+    val totalSize = N_LEN + prepared.headerBytes.size + prepared.offset
+    bufferedWriteToFile(filename, prepared.n, prepared.headerBytes, tensors, totalSize)
 }
 
 /**
@@ -321,8 +370,13 @@ public fun serializeNamedToFile(
     dataInfo: Map<String, String>?,
     filename: String,
 ) {
-    val bytes = serializeNamed(data, dataInfo)
-    virtualFileStore[filename] = bytes
+    val entries = data.map { it.name to it.view }
+    val (prepared, tensors) = prepare(entries, dataInfo)
+    if (prepared.n > MAX_HEADER_SIZE.toULong()) {
+        throw SafeTensorError.HeaderTooLarge()
+    }
+    val totalSize = N_LEN + prepared.headerBytes.size + prepared.offset
+    bufferedWriteToFile(filename, prepared.n, prepared.headerBytes, tensors, totalSize)
 }
 
 /**
@@ -376,7 +430,8 @@ public class SafeTensors internal constructor(
                 } catch (e: CharacterCodingException) {
                     throw SafeTensorError.InvalidHeader(e.message ?: "invalid UTF-8")
                 }
-            val metadata = parseHashMetadata(string)
+            val hashdata = parseHashMetadata(string)
+            val metadata = hashdata.tryInto()
             val bufferEnd = metadata.validate()
             if (bufferEnd.toLong() + N_LEN.toLong() + n.toLong() != bufferLen.toLong()) {
                 throw SafeTensorError.MetadataIncompleteBuffer()
@@ -454,8 +509,8 @@ public class SafeTensors internal constructor(
 private class SeedOf<T>(
     private val deserialize: Deserialize<T>,
 ) : DeserializeSeed<T> {
-    override fun <D> deserialize(deserializer: D): SerdeResult<T>
-        where D : Deserializer = deserialize.deserialize(deserializer)
+    override fun <D : Deserializer> deserialize(deserializer: D): SerdeResult<T> =
+        deserialize.deserialize(deserializer)
 }
 
 private class StringSerialize(
@@ -483,7 +538,61 @@ private class OffsetsPairSerialize(
     override fun <Ok> serialize(serializer: Serializer<Ok>): SerdeResult<Ok> = Pair(start, stop).serialize(serializer)
 }
 
-private fun parseHashMetadata(jsonString: String): Metadata {
+/**
+ * Helper struct used only for serialization and deserialization.
+ */
+internal class HashMetadata(
+    val metadata: Map<String, String>?,
+    val tensors: Map<String, TensorInfo>,
+) {
+    public companion object : Deserialize<HashMetadata> {
+        override fun <D : Deserializer> deserialize(deserializer: D): SerdeResult<HashMetadata> =
+            deserializer.deserializeMap(
+                object : Visitor<HashMetadata> {
+                    override fun expecting(): String = "struct HashMetadata"
+
+                    override fun <A : MapAccess> visitMap(access: A): SerdeResult<HashMetadata> =
+                        serdeCatching {
+                            var meta: Map<String, String>? = null
+                            val tensorsMap = LinkedHashMap<String, TensorInfo>()
+                            val metaDeserialize =
+                                io.github.kotlinmania.serdecore.de.mapDeserialize(
+                                    StringDeserialize,
+                                    StringDeserialize,
+                                )
+                            while (true) {
+                                val key = access.nextKeySeed(SeedOf(StringDeserialize)).getOrThrow() ?: break
+                                if (key == "__metadata__") {
+                                    meta = access.nextValueSeed(SeedOf(metaDeserialize)).getOrThrow()
+                                } else {
+                                    val info = access.nextValueSeed(SeedOf(TensorInfo.Companion)).getOrThrow()
+                                    tensorsMap[key] = info
+                                }
+                            }
+                            HashMetadata(meta, tensorsMap)
+                        }
+                },
+            )
+
+        public fun tryFrom(hashdata: HashMetadata): Metadata {
+            val sortedTensors =
+                hashdata.tensors.entries
+                    .map { NamedTensorInfo(it.key, it.value) }
+                    .toMutableList()
+            sortedTensors.sortWith { a, b ->
+                val aOffsets = a.info.dataOffsets
+                val bOffsets = b.info.dataOffsets
+                val startCmp = aOffsets.start.compareTo(bOffsets.start)
+                if (startCmp != 0) startCmp else aOffsets.stop.compareTo(bOffsets.stop)
+            }
+            return Metadata.new(hashdata.metadata, sortedTensors)
+        }
+    }
+
+    public fun tryInto(): Metadata = tryFrom(this)
+}
+
+private fun parseHashMetadata(jsonString: String): HashMetadata {
     val trimmed = jsonString.trim { it == ' ' || it == '\t' || it == '\n' || it == '\r' }
     if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
         throw SafeTensorError.InvalidHeaderDeserialization("expected JSON object")
@@ -497,7 +606,7 @@ private fun parseHashMetadata(jsonString: String): Metadata {
             ?: throw SafeTensorError.InvalidHeaderDeserialization("header root must be a JSON object")
 
     var metadataMap: Map<String, String>? = null
-    val rawTensors = ArrayList<NamedTensorInfo>()
+    val tensorsMap = LinkedHashMap<String, TensorInfo>()
 
     for ((key, value) in rootObj) {
         if (key == "__metadata__") {
@@ -561,17 +670,11 @@ private fun parseHashMetadata(jsonString: String): Metadata {
                     dataOffsets = ByteSpan(startInt, stopInt),
                     rawShapeULongs = shapeULongs,
                 )
-            rawTensors.add(NamedTensorInfo(key, info))
+            tensorsMap[key] = info
         }
     }
 
-    rawTensors.sortWith { a, b ->
-        val aOffsets = a.info.dataOffsets
-        val bOffsets = b.info.dataOffsets
-        val startCmp = aOffsets.start.compareTo(bOffsets.start)
-        if (startCmp != 0) startCmp else aOffsets.stop.compareTo(bOffsets.stop)
-    }
-    return Metadata.new(metadataMap, rawTensors)
+    return HashMetadata(metadataMap, tensorsMap)
 }
 
 private fun checkedMulULong(a: ULong, b: ULong): ULong? {
@@ -610,45 +713,15 @@ public class Metadata internal constructor(
             return result
         }
 
-        override fun <D> deserialize(deserializer: D): SerdeResult<Metadata>
-            where D : Deserializer =
-            deserializer.deserializeMap(
-                object : Visitor<Metadata> {
-                    override fun expecting(): String = "struct Metadata"
-
-                    override fun <A> visitMap(access: A): SerdeResult<Metadata>
-                        where A : MapAccess =
-                        serdeCatching {
-                            var meta: Map<String, String>? = null
-                            val rawTensors = ArrayList<NamedTensorInfo>()
-                            val metaDeserialize =
-                                io.github.kotlinmania.serdecore.de.mapDeserialize(
-                                    StringDeserialize,
-                                    StringDeserialize,
-                                )
-                            while (true) {
-                                val key = access.nextKeySeed(SeedOf(StringDeserialize)).getOrThrow() ?: break
-                                if (key == "__metadata__") {
-                                    meta = access.nextValueSeed(SeedOf(metaDeserialize)).getOrThrow()
-                                } else {
-                                    val info = access.nextValueSeed(SeedOf(TensorInfo.Companion)).getOrThrow()
-                                    rawTensors.add(NamedTensorInfo(key, info))
-                                }
-                            }
-                            rawTensors.sortWith { a, b ->
-                                val aOffsets = a.info.dataOffsets
-                                val bOffsets = b.info.dataOffsets
-                                val startCmp = aOffsets.start.compareTo(bOffsets.start)
-                                if (startCmp != 0) startCmp else aOffsets.stop.compareTo(bOffsets.stop)
-                            }
-                            try {
-                                new(meta, rawTensors)
-                            } catch (e: SafeTensorError) {
-                                throw SerdeException(SerdeError.custom(e.message ?: "invalid metadata"))
-                            }
-                        }
-                },
-            )
+        override fun <D : Deserializer> deserialize(deserializer: D): SerdeResult<Metadata> =
+            serdeCatching {
+                val hashdata = HashMetadata.deserialize(deserializer).getOrThrow()
+                try {
+                    hashdata.tryInto()
+                } catch (e: SafeTensorError) {
+                    throw SerdeException(SerdeError.custom(e.message ?: "invalid metadata"))
+                }
+            }
     }
 
     override fun <Ok> serialize(serializer: Serializer<Ok>): SerdeResult<Ok> =
@@ -753,7 +826,8 @@ public class TensorView internal constructor(
     internal val dtypeVal: Dtype,
     internal val shapeVal: List<Int>,
     internal val dataVal: ByteArray,
-) : View {
+) : View,
+    IndexOp<TensorIndexer> {
     public companion object {
         /** Create a new [TensorView]. */
         public fun new(
@@ -801,7 +875,7 @@ public class TensorView internal constructor(
     public fun slicedData(slices: List<TensorIndexer>): SliceIterator = SliceIterator.new(this, slices)
 
     /** Slice this tensor along 1 dimension. */
-    public fun slice(index: TensorIndexer): SliceIterator = slicedData(listOf(index))
+    override fun slice(index: TensorIndexer): SliceIterator = slicedData(listOf(index))
 
     /** Slice this tensor along 2 dimensions. */
     public fun slice(
@@ -809,12 +883,20 @@ public class TensorView internal constructor(
         index1: TensorIndexer,
     ): SliceIterator = slicedData(listOf(index0, index1))
 
+    /** Slice this tensor along 2 dimensions via [Pair]. */
+    public fun slice(index: Pair<TensorIndexer, TensorIndexer>): SliceIterator =
+        slicedData(listOf(index.first, index.second))
+
     /** Slice this tensor along 3 dimensions. */
     public fun slice(
         index0: TensorIndexer,
         index1: TensorIndexer,
         index2: TensorIndexer,
     ): SliceIterator = slicedData(listOf(index0, index1, index2))
+
+    /** Slice this tensor along 3 dimensions via [Triple]. */
+    public fun slice(index: Triple<TensorIndexer, TensorIndexer, TensorIndexer>): SliceIterator =
+        slicedData(listOf(index.first, index.second, index.third))
 
     /** Slice this tensor using a list of [TensorIndexer]s. */
     public fun slice(slices: List<TensorIndexer>): SliceIterator = slicedData(slices)
@@ -861,16 +943,14 @@ public class TensorInfo internal constructor(
     public companion object : Deserialize<TensorInfo> {
         private val FIELDS: List<String> = listOf("dtype", "shape", "data_offsets")
 
-        override fun <D> deserialize(deserializer: D): SerdeResult<TensorInfo>
-            where D : Deserializer =
+        override fun <D : Deserializer> deserialize(deserializer: D): SerdeResult<TensorInfo> =
             deserializer.deserializeStruct(
                 "TensorInfo",
                 FIELDS,
                 object : Visitor<TensorInfo> {
                     override fun expecting(): String = "struct TensorInfo"
 
-                    override fun <A> visitMap(access: A): SerdeResult<TensorInfo>
-                        where A : MapAccess =
+                    override fun <A : MapAccess> visitMap(access: A): SerdeResult<TensorInfo> =
                         serdeCatching {
                             var dtypeVal: Dtype? = null
                             var shapeULongs: List<ULong>? = null
@@ -1056,8 +1136,7 @@ public enum class Dtype(
 
         public fun fromWireName(name: String): Dtype? = entries.firstOrNull { it.wireName == name }
 
-        override fun <D> deserialize(deserializer: D): SerdeResult<Dtype>
-            where D : Deserializer =
+        override fun <D : Deserializer> deserialize(deserializer: D): SerdeResult<Dtype> =
             deserializer.deserializeEnum(
                 "Dtype",
                 VARIANTS,
@@ -1070,8 +1149,7 @@ public enum class Dtype(
 
                     override fun visitString(v: String): SerdeResult<Dtype> = visitStr(v)
 
-                    override fun <A> visitEnum(access: A): SerdeResult<Dtype>
-                        where A : EnumAccess =
+                    override fun <A : EnumAccess> visitEnum(access: A): SerdeResult<Dtype> =
                         serdeCatching {
                             val (variantName, variant) = access.variantSeed(SeedOf(StringDeserialize)).getOrThrow()
                             variant.unitVariant().getOrThrow()

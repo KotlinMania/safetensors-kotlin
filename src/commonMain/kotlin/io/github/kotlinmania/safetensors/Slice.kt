@@ -117,6 +117,34 @@ public sealed class TensorIndexer {
 }
 
 /**
+ * Trait used to implement multiple signatures for ease of use of the slicing
+ * of a tensor.
+ */
+public interface IndexOp<T> {
+    /**
+     * Returns a slicing iterator which are the chunks of data necessary to
+     * reconstruct the desired tensor.
+     */
+    public fun slice(index: T): SliceIterator
+}
+
+/**
+ * Byte ranges into a tensor's data section in iteration order;
+ * concatenating them yields the dense destination layout.
+ */
+public typealias SliceByteRanges = List<ByteSpan>
+
+/**
+ * Post-slice tensor shape (element counts per dim).
+ */
+public typealias SlicedShape = List<Int>
+
+/**
+ * Element item type of [SliceIterator].
+ */
+public typealias Item = ByteArray
+
+/**
  * Half-open byte range `[start, stop)` into a tensor's data section.
  */
 public data class ByteSpan(
@@ -128,8 +156,8 @@ public data class ByteSpan(
  * Computed byte ranges and post-slice shape for a slicing operation.
  */
 public data class SliceByteRangesOutput(
-    public val ranges: List<ByteSpan>,
-    public val shape: List<Int>,
+    public val ranges: SliceByteRanges,
+    public val shape: SlicedShape,
 )
 
 /**
